@@ -27,7 +27,7 @@ def device_sync(device):
 
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
-#torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future
+torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future
 
 
 # support running without installing as a package
@@ -150,6 +150,7 @@ def generate(
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
     callback = lambda x: x,
+    precision=torch.bfloat16,
     **sampling_kwargs
 ) -> torch.Tensor:
     """
@@ -169,7 +170,7 @@ def generate(
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
     with torch.device(device):
         print(device)
-        model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
+        model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length, dtype=precision)
         if is_speculative and draft_model is not model:
             draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
         # xx
@@ -275,7 +276,9 @@ def main(
     rank = None
 
     print(f"Using device={device}")
-    precision = torch.bfloat16
+    # precision = torch.bfloat16
+    precision = torch.float32
+    # precision = torch.float16
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
 
@@ -363,6 +366,7 @@ def main(
                 callback=callback,
                 temperature=temperature,
                 top_k=top_k,
+                precision=precision
             )
             aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
         if i == -1:
