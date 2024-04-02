@@ -83,7 +83,7 @@ class Transformer(nn.Module):
         self.max_seq_length = -1
         self.partial_rotatory_factor = 0.4
     
-    def setup_caches(self, max_batch_size, max_seq_length):
+    def setup_caches(self, max_batch_size, max_seq_length, dtype=torch.bfloat16):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
         head_dim = self.config.dim // self.config.n_head
@@ -91,7 +91,7 @@ class Transformer(nn.Module):
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim)
+            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype=dtype)
             b.attention._init_rope()
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
@@ -147,7 +147,7 @@ class Attention(nn.Module):
 
     def forward(self, x: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         bsz, seqlen, _ = x.shape
-
+        # print(x.shape)
         kv_size = self.n_local_heads * self.head_dim
         q = self.wq(x)
         k = self.wk(x)
