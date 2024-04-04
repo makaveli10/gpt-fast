@@ -173,7 +173,6 @@ def generate(
         model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length, dtype=precision)
         if is_speculative and draft_model is not model:
             draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
-        # xx
 
     # create an empty tensor of the expected final shape and fill in the current tokens
     print(T_new, T, prompt)
@@ -215,11 +214,24 @@ def generate(
     }
     return seq, generate_stats
 
-def encode_tokens(tokenizer, string, bos=False, device='cuda'):
-    tokens = tokenizer.encode(string)
+def encode_tokens(tokenizer, string, bos=False, device='cuda', chat_ml=False, system_prompt=None):
+    if chat_ml:
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.append({"role": "user", "content": string})
+        chat = tokenizer.apply_chat_template(messages, tokenize=False).strip()
+        print(chat)
+        tokenized_sample = tokenizer(
+            chat, add_special_tokens=False, return_tensors="pt"
+        ).to("cuda")
+        tokens = tokenized_sample["input_ids"][0]
+    else:
+        tokens = tokenizer.encode(string)
     if bos:
         tokens = [tokenizer.encode(tokenizer.bos_token)[0]] + tokens
-    return torch.tensor(tokens, dtype=torch.int, device=device)
+    if not isinstance(tokens, torch.Tensor):
+        torch.tensor(tokens, dtype=torch.int, device=device)
+
+    return tokens.to(torch.int)
 
 def _load_model(checkpoint_path, device, precision):
     with torch.device('meta'):
@@ -264,20 +276,28 @@ def main(
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
     device='cuda',
+    chat_ml: bool = False,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
     assert checkpoint_path.is_file(), checkpoint_path
+    
+    tokenizer_path = checkpoint_path.parent
 
-    # tokenizer_path = checkpoint_path.parent / "tokenizer.model"
-    # assert tokenizer_path.is_file(), tokenizer_path
+    try:
+        import json
+        with open("col-data-v6.json", "r") as file:
+            data = json.load(file)
+        system_prompt = data[-1]["prompt"]
+    except Exception as e:
+        print(e)
 
-    global print
+    
     rank = None
 
     print(f"Using device={device}")
-    # precision = torch.bfloat16
-    precision = torch.float32
+    precision = torch.bfloat16
+    # precision = torch.float32
     # precision = torch.float16
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
@@ -294,10 +314,8 @@ def main(
     device_sync(device=device) # MKG
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/phi-2")
-    # tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
-    encoded = encode_tokens(tokenizer, prompt, bos=False, device=device)
-    # encoded = tokenizer(prompt, return_attention_mask=False, return_tensors="pt")["input_ids"][0].to(torch.int32).cuda()
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    encoded = encode_tokens(tokenizer, prompt, bos=False, device=device, chat_ml=chat_ml, system_prompt=system_prompt)
     prompt_length = encoded.size(0)
 
     torch.manual_seed(1234)
@@ -401,7 +419,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Your CLI description.')
 
-    parser.add_argument('--prompt', type=str, default="Hello, my name is Samantha.", help='Input prompt.')
+    parser.add_argument('--prompt', type=str, default="Hello, I am ready.", help='Input prompt.')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
     parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
@@ -410,6 +428,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
+    parser.add_argument('--chat_ml', action='store_true', help='Whether to apply chatml template to prompt')
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
@@ -419,6 +438,6 @@ if __name__ == '__main__':
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
+        args.speculate_k, args.device, args.chat_ml
     )
 
