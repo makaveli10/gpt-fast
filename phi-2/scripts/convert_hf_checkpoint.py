@@ -23,6 +23,7 @@ def convert_hf_checkpoint(
     *,
     checkpoint_dir: Path = Path("checkpoints/micorosoft/phi-2"),
     model_name: Optional[str] = None,
+    gqa=False
 ) -> None:
     if model_name is None:
         model_name = checkpoint_dir.name
@@ -93,29 +94,30 @@ def convert_hf_checkpoint(
 
         final_result[new_key] = value
 
-    # for key in tuple(final_result.keys()):
-    #     if "wq.weight" in key:
-    #         print(key)
-    #         q = final_result[key]
-    #         k = final_result[key.replace("wq", "wk")]
-    #         v = final_result[key.replace("wq", "wv")]
-    #         q = permute(q, config.n_head)
-    #         k = permute(k, config.n_local_heads)
-    #         final_result[key.replace("wq", "wqkv")] = torch.cat([q, k, v])
-    #         del final_result[key]
-    #         del final_result[key.replace("wq", "wk")]
-    #         del final_result[key.replace("wq", "wv")]
-    #     if "wq.bias" in key:
-    #         print(key)
-    #         q = final_result[key]
-    #         k = final_result[key.replace("wq", "wk")]
-    #         v = final_result[key.replace("wq", "wv")]
-    #         final_result[key.replace("wq", "wqkv")] = torch.cat([q, k, v])
-    #         del final_result[key]
-    #         del final_result[key.replace("wq", "wk")]
-    #         del final_result[key.replace("wq", "wv")]
-    print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
-    torch.save(final_result, checkpoint_dir / "model.pth")
+    if gqa:
+        num_original_heads = 32
+        num_target_heads = 8
+        head_dim = 80
+        bias_shape = num_original_heads * head_dim
+
+        for key in tuple(final_result.keys()):
+            if "wk.weight" in key or "wv.weight" in key:
+                original_weight = final_result[key]            
+                reshaped_weights = original_weight.view(num_original_heads, head_dim, -1)
+                pooled_heads = torch.mean(
+                    reshaped_weights.view(num_target_heads, -1, head_dim, reshaped_weights.shape[2]), dim=1)
+                new_weights = pooled_heads.view(num_target_heads * head_dim, -1)
+                final_result[key] = new_weights
+            
+            elif "wk.bias" in key or "wv.bias" in key:
+                original_biases = final_result[key]
+                reshaped_biases = original_biases.view(num_target_heads, -1, head_dim).mean(dim=1)
+                final_result[key] = reshaped_biases.view(-1)
+        print(f"Saving checkpoint to {checkpoint_dir / 'model_gqa.pth'}")
+        torch.save(final_result, checkpoint_dir / "model_gqa.pth")
+    else:
+        print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
+        torch.save(final_result, checkpoint_dir / "model.pth")
 
 
 
@@ -124,9 +126,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Convert HuggingFace checkpoint.')
     parser.add_argument('--checkpoint_dir', type=Path, default=Path("checkpoints/microsoft/phi-2"))
     parser.add_argument('--model_name', type=str, default=None)
+    parser.add_argument('--gqa', action='store_true', help='GQA')
 
     args = parser.parse_args()
     convert_hf_checkpoint(
         checkpoint_dir=args.checkpoint_dir,
         model_name=args.model_name,
+        gqa=args.gqa
     )
