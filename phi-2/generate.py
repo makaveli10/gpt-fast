@@ -229,7 +229,7 @@ def encode_tokens(tokenizer, string, bos=False, device='cuda', chat_ml=False, sy
     if bos:
         tokens = [tokenizer.encode(tokenizer.bos_token)[0]] + tokens
     if not isinstance(tokens, torch.Tensor):
-        torch.tensor(tokens, dtype=torch.int, device=device)
+        tokens = torch.tensor(tokens, dtype=torch.int, device=device)
 
     return tokens.to(torch.int)
 
@@ -315,7 +315,7 @@ def main(
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    encoded = encode_tokens(tokenizer, prompt, bos=False, device=device, chat_ml=chat_ml, system_prompt=system_prompt)
+    encoded = encode_tokens(tokenizer, prompt, bos=False, device=device)
     prompt_length = encoded.size(0)
 
     torch.manual_seed(1234)
@@ -419,7 +419,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Your CLI description.')
 
-    parser.add_argument('--prompt', type=str, default="Hello, I am ready.", help='Input prompt.')
+    parser.add_argument('--prompt', type=str, default="Hello, my name is ", help='Input prompt.')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
     parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
