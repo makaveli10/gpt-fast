@@ -69,7 +69,7 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
 
-def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
+def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, tokenizer=None, **sampling_kwargs):
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
@@ -81,6 +81,10 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
             callback(new_tokens[-1])
             new_probs.append(next_prob.clone())
             cur_token = next_token.view(1, -1)
+            
+            if next_token[-1] == tokenizer.eos_token_id:
+            #  next_token[-1] == tokenizer.convert_tokens_to_ids("<|end|>"):
+                break
 
     return new_tokens, new_probs
 
@@ -150,6 +154,7 @@ def generate(
     speculate_k: Optional[int] = 8,
     callback = lambda x: x,
     precision=torch.bfloat16,
+    tokenizer=None,
     **sampling_kwargs
 ) -> torch.Tensor:
     """
@@ -174,16 +179,12 @@ def generate(
             draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
 
     # create an empty tensor of the expected final shape and fill in the current tokens
-    print(T_new, T, prompt)
-    empty = torch.empty(T_new, dtype=dtype, device=device)
-    empty[:T] = prompt
-    seq = empty
     input_pos = torch.arange(0, T, device=device)
 
     next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs)
     if is_speculative:
         prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
-    seq[T] = next_token
+    seq = next_token
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
@@ -205,8 +206,8 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
-        seq[T + 1:] = torch.cat(generated_tokens)
+        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, tokenizer=tokenizer, **sampling_kwargs)
+        seq = torch.cat((seq, torch.cat(generated_tokens)))
 
     generate_stats = {
         'accept_counts': accept_counts
@@ -215,12 +216,10 @@ def generate(
 
 def encode_tokens(tokenizer, string, bos=False, device='cuda', chat_ml=False, system_prompt=None):
     if chat_ml:
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.append({"role": "user", "content": string})
-        chat = tokenizer.apply_chat_template(messages, tokenize=False).strip()
+        chat = format_prompt_qa(string)
         print(chat)
         tokenized_sample = tokenizer(
-            chat, add_special_tokens=False, return_tensors="pt"
+            chat, add_special_tokens=True, return_tensors="pt"
         ).to("cuda")
         tokens = tokenized_sample["input_ids"][0]
     else:
@@ -231,6 +230,15 @@ def encode_tokens(tokenizer, string, bos=False, device='cuda', chat_ml=False, sy
         tokens = torch.tensor(tokens, dtype=torch.int, device=device)
 
     return tokens.to(torch.int)
+
+
+def format_prompt_qa(prompt, conversation_history=None):
+    formatted_prompt = ""
+    if conversation_history is not None:
+        for user_prompt, llm_response in conversation_history:
+            formatted_prompt += f"Instruct: {user_prompt}\nOutput:{llm_response}\n"
+    return f"{formatted_prompt}Instruct: {prompt}\nOutput:"
+
 
 def _load_model(checkpoint_path, device, precision):
     with torch.device('meta'):
@@ -283,14 +291,6 @@ def main(
     
     tokenizer_path = checkpoint_path.parent
 
-    try:
-        import json
-        with open("col-data-v6.json", "r") as file:
-            data = json.load(file)
-        system_prompt = data[-1]["prompt"]
-    except Exception as e:
-        print(e)
-
     
     rank = None
 
@@ -314,9 +314,8 @@ def main(
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    encoded = encode_tokens(tokenizer, prompt, bos=False, device=device)
+    encoded = encode_tokens(tokenizer, prompt, bos=False, chat_ml=chat_ml, device=device)
     prompt_length = encoded.size(0)
-
     torch.manual_seed(1234)
     model_size = sum([p.numel() * p.dtype.itemsize for p in itertools.chain(model.parameters(), model.buffers())])
     if compile:
@@ -346,7 +345,6 @@ def main(
             if is_chat:
                 prompt = f"{B_INST} {prompt.strip()} {E_INST}"
             encoded = encode_tokens(tokenizer, prompt, bos=False, device=device)
-            # encoded = tokenizer(prompt, return_attention_mask=False, return_tensors="pt")["input_ids"][0].to(torch.int32).cuda()
 
         if interactive and i >= 0:
             buffer = []
@@ -381,6 +379,7 @@ def main(
                 speculate_k=speculate_k,
                 interactive=interactive,
                 callback=callback,
+                tokenizer=tokenizer,
                 temperature=temperature,
                 top_k=top_k,
                 precision=precision
@@ -395,7 +394,7 @@ def main(
         t = time.perf_counter() - t0
 
         if not interactive:
-            print(tokenizer.decode(y.tolist()))
+            print(tokenizer.decode(y.tolist(), skip_special_tokens=True))
         else:
             print()
         tokens_generated = y.size(0) - prompt_length
@@ -418,7 +417,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Your CLI description.')
 
-    parser.add_argument('--prompt', type=str, default="Hello, my name is ", help='Input prompt.')
+    parser.add_argument('--prompt', type=str, default="Tell me what is overfitting.", help='Input prompt.')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
     parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')

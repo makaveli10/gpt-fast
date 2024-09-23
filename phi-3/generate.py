@@ -3,6 +3,9 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import itertools
 import sys
 import time
@@ -24,7 +27,6 @@ def device_sync(device):
 
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
-torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future
 
 default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -65,7 +67,7 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
 
-def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
+def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, tokenizer = None, **sampling_kwargs):
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
@@ -77,6 +79,8 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
             callback(new_tokens[-1])
             new_probs.append(next_prob.clone())
             cur_token = next_token.view(1, -1)
+            if next_token[-1] == tokenizer.eos_token_id:
+                break
 
     return new_tokens, new_probs
 
@@ -144,6 +148,7 @@ def generate(
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
     callback = lambda x: x,
+    tokenizer = None,
     **sampling_kwargs
 ) -> torch.Tensor:
     """
@@ -167,15 +172,13 @@ def generate(
             draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
 
     # create an empty tensor of the expected final shape and fill in the current tokens
-    empty = torch.empty(T_new, dtype=dtype, device=device)
-    empty[:T] = prompt
-    seq = empty
     input_pos = torch.arange(0, T, device=device)
 
     next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs).clone()
     if is_speculative:
         prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
-    seq[T] = next_token
+    seq = next_token
+
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
@@ -197,19 +200,35 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
-        seq[T + 1:] = torch.cat(generated_tokens)
+        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, tokenizer=tokenizer, **sampling_kwargs)
+        seq = torch.cat((seq, torch.cat(generated_tokens)))
+
 
     generate_stats = {
         'accept_counts': accept_counts
     }
     return seq, generate_stats
 
-def encode_tokens(tokenizer, string, bos=True, device=default_device):
-    tokens = tokenizer.encode(string)
+def encode_tokens(tokenizer, string, bos=True, chat_ml=False, device=default_device):
+    if chat_ml:
+        prompt = format_prompt(string, tokenizer)
+        tokens = tokenizer.encode(prompt, add_special_tokens=True)
+    else:
+        tokens = tokenizer.encode(string)
     if bos:
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
+
+def format_prompt(prompt, tokenizer, conversation_history=None):
+    messages = []
+    if conversation_history is not None and len(conversation_history):
+        for user, assistant in conversation_history:
+            user = {"role": "user", "content": user}
+            assistant = {"role": "assistant", "content": assistant}
+            messages.append(user)
+            messages.append(assistant)
+    messages.append({"role": "user", "content": prompt})
+    return tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True, tokenize=False)
 
 def _load_model(checkpoint_path, device, precision, use_tp):
     use_cuda = 'cuda' in device
@@ -271,6 +290,7 @@ def main(
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
     device=default_device,
+    chat_ml: bool = False,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -305,9 +325,10 @@ def main(
     device_sync(device=device) # MKG
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
-    tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path.parent)
 
-    encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+    encoded = encode_tokens(tokenizer, prompt, bos=False, chat_ml=chat_ml, device=device)
     prompt_length = encoded.size(0)
 
     torch.manual_seed(1234)
@@ -375,6 +396,7 @@ def main(
                 speculate_k=speculate_k,
                 interactive=interactive,
                 callback=callback,
+                tokenizer=tokenizer,
                 temperature=temperature,
                 top_k=top_k,
             )
@@ -391,7 +413,7 @@ def main(
         t = time.perf_counter() - t0
 
         if not interactive:
-            print(tokenizer.decode(y.tolist()))
+            print(tokenizer.decode(y.tolist(), skip_special_tokens=True))
         else:
             print()
         tokens_generated = y.size(0) - prompt_length
@@ -414,7 +436,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Your CLI description.')
 
-    parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
+    parser.add_argument('--prompt', type=str, default="Tell me what is overfitting.", help='Input prompt.')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
     parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
@@ -427,10 +449,11 @@ if __name__ == '__main__':
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
+    parser.add_argument('--chat_ml', action='store_true', help='Whether to apply chatml template to prompt')
 
     args = parser.parse_args()
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
+        args.speculate_k, args.device, args.chat_ml
     )
